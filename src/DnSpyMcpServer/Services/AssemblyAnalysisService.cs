@@ -676,7 +676,7 @@ internal sealed class AssemblyAnalysisService
         var localMap = new Dictionary<Local, Local>();
         foreach (var local in source.Body.Variables)
         {
-            var clonedLocal = new Local(importer.Import(local.Type));
+            var clonedLocal = new Local(ImportLocalType(targetModule, importer, local.Type));
             localMap[local] = clonedLocal;
             body.Variables.Add(clonedLocal);
         }
@@ -773,6 +773,32 @@ internal sealed class AssemblyAnalysisService
                 $"Cannot safely graft the composed type '{type.FullName}': it is built over one of the target module's " +
                 "own types, which is outside the supported imperative-body scope. Rewrite the body to avoid it, or use " +
                 "set_function_opcodes/overwrite_method_body.");
+
+        return importer.Import(type);
+    }
+
+    // A local variable's type follows the same rule as instruction operands: if it names a type defined in the module
+    // being patched (e.g. a `StatModifier x;` local where StatModifier belongs to the target), it must resolve to the
+    // module's own definition. A raw importer.Import would leave a dangling TypeRef into the throwaway compiled patch
+    // assembly, which decompiles fine but the runtime rejects when it JITs the method.
+    private static TypeSig ImportLocalType(ModuleDefMD targetModule, Importer importer, TypeSig type)
+    {
+        if (type is TypeDefOrRefSig leaf)
+        {
+            var localDef = targetModule.Find(leaf.TypeDefOrRef.FullName, false);
+            if (localDef is not null)
+                return localDef.ToTypeSig();
+        }
+        else if (ReferencesLocalType(targetModule, type))
+        {
+            // A composed local (array, byref, generic instantiation) built over one of the target's own types is
+            // outside the supported imperative-body scope, mirroring the TypeSpec guard in ImportType. Fail loudly
+            // instead of writing a corrupt locals signature. Pure BCL composites reference no local type and import.
+            throw new InvalidOperationException(
+                $"Cannot safely graft a local of type '{type.FullName}': it is composed over one of the target module's " +
+                "own types, which is outside the supported imperative-body scope. Rewrite the body to avoid it, or use " +
+                "set_function_opcodes/overwrite_method_body.");
+        }
 
         return importer.Import(type);
     }
