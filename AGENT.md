@@ -14,10 +14,14 @@ It provides tools to:
 - inspect IL (`get_method_il`, `find_string_references`)
 - generate dnSpy navigation instructions (`format_dnspy_jump`)
 - patch binaries (`patch_replace_string_literal`, `patch_nop_instructions`)
+- rename symbols (`rename_type`, `rename_method`, `rename_namespace`)
+- assemble IL (`set_function_opcodes`, `overwrite_method_body`)
+- recompile a method from C# (`update_method_source`)
 
 It does **not** require the dnSpy app at runtime. It uses:
 - `dnlib`
 - `ICSharpCode.Decompiler`
+- `Microsoft.CodeAnalysis.CSharp` (Roslyn, for `update_method_source`)
 
 ---
 
@@ -101,13 +105,43 @@ Token-rich output is intentional:
 - target by `methodDefToken` + `ilOffset`
 - NOPs `count` instructions from that offset
 
+### Refactor / write tools
+
+Target a method by `typeFullName` + `methodName` (+ optional `parameterTypeNames`), matching `decompile_method` and `get_method_il`, so a read-then-write flow uses the same identifiers.
+
+11. `rename_type`
+- set `TypeDef.Name`, optionally `TypeDef.Namespace` via `newNamespace`
+
+12. `rename_method`
+- set `MethodDef.Name`, overload-aware
+
+13. `rename_namespace`
+- set `Namespace` on every `TypeDef` in `oldNamespace`
+
+14. `set_function_opcodes`
+- assemble `ilOpcodes` and edit at a 0-based `index`
+- `mode = Overwrite` replaces from the index, `Append` inserts
+
+15. `overwrite_method_body`
+- clear the body and rebuild it entirely from `ilOpcodes`
+
+16. `update_method_source`
+- compile a full C# method with Roslyn, then splice its IL into the target
+- references to the target assembly's own types are resolved to local definitions; only external/BCL references are imported
+
+IL assembler operand support (`set_function_opcodes`, `overwrite_method_body`): no-operand opcodes, `ldstr`, `ldc.i4/i8/r4/r8`, `call`/`callvirt`/`newobj` (as `Type::Method(ParamType, ...)`), `ld`/`st` fields (as `Type::Field`), type operands, and branch targets addressed by 0-based instruction index. Anything else fails loudly rather than emitting a wrong instruction.
+
+`update_method_source` limits: the declared method name must match the target, the signature must line up (same static/instance and parameter count), and only imperative bodies are supported (no lambdas, async, iterators, or access to the target type's own private members, since these need generated helper types that do not exist in the target).
+
 #### Patch safety rule
 
-**Backups are always created before any patch**.
+**Backups are always created before any write**.
 
-For each patch call:
-- source file is copied to `sourcePath.yyyyMMdd_HHmmss.bak`
-- patch is then written to destination
+For each write call:
+- source file is copied to `sourcePath.yyyyMMdd_HHmmss.bak` (a numeric suffix is added if that name already exists)
+- the change is then written to the destination
+
+Rename and IL/source rewrites can break strong-name/signing expectations and, for renames, do not fix reflection or string-based lookups. In-place writes overwrite the original (a `.bak` is still created first) and the cache is invalidated so later reads in the same session reflect the change; use the default `*.patched` output when you want the original left untouched.
 
 Destination behavior:
 - if `inPlace = true`: destination = source file

@@ -38,10 +38,16 @@ For full implementation details, see `AGENT.md`.
 - `format_dnspy_jump` (turn tokens/IL offsets into direct dnSpy navigation steps)
 - `patch_replace_string_literal` (patch one IL string literal)
 - `patch_nop_instructions` (NOP one/many IL instructions)
+- `rename_type` (rename a type, optionally move its namespace)
+- `rename_method` (rename a method, overload-aware)
+- `rename_namespace` (rename a namespace across all its types)
+- `set_function_opcodes` (edit method IL at an instruction index; `Overwrite` or `Append`)
+- `overwrite_method_body` (rebuild a method body entirely from IL opcode lines)
+- `update_method_source` (recompile a C# method with Roslyn and splice its IL back in)
 
 Navigation-friendly output: search/method/reference results include metadata tokens (`TypeDef`, `MethodDef`, etc.) so you can jump directly in dnSpy by token.
 
-Patch safety: patch tools **always create a backup** before writing changes.
+Write safety: every write/patch tool **always creates a timestamped `.bak` backup** before writing, and by default writes to a `*.patched.<ext>` copy (pass `inPlace: true` to overwrite the original). Writing a modified module can break strong-name/signing expectations, so validate patched binaries in isolation.
 
 All tools return:
 - `content` (text)
@@ -272,6 +278,57 @@ Tip: also search fragments like `Pictures\\Screenshots` or just `Screenshot`.
   "ilOffset": "IL_01DD",
   "count": 1,
   "inPlace": false
+}
+```
+
+## Write / refactor tools
+
+All of these always create a backup first and, unless `inPlace: true`, write to a `*.patched.<ext>` copy.
+
+`rename_method` (rename `Login` to `SignIn`):
+
+```json
+{
+  "assemblyPath": "C:/path/target.dll",
+  "typeFullName": "MyApp.Services.AuthService",
+  "methodName": "Login",
+  "newName": "SignIn",
+  "parameterTypeNames": ["System.String", "System.String"]
+}
+```
+
+`overwrite_method_body` (make a method return the constant 42). Branch operands are a 0-based index into the `ilOpcodes` list:
+
+```json
+{
+  "assemblyPath": "C:/path/target.dll",
+  "typeFullName": "MyApp.Licensing",
+  "methodName": "DaysRemaining",
+  "ilOpcodes": ["ldc.i4 42", "ret"]
+}
+```
+
+`set_function_opcodes` (replace instructions starting at index 0):
+
+```json
+{
+  "assemblyPath": "C:/path/target.dll",
+  "typeFullName": "MyApp.Licensing",
+  "methodName": "IsValid",
+  "ilOpcodes": ["ldc.i4.1", "ret"],
+  "index": 0,
+  "mode": "Overwrite"
+}
+```
+
+`update_method_source` (rewrite a method body in C#; the declared method name must match). Only imperative bodies are supported (no lambdas, async, iterators, or access to the target type's own private members):
+
+```json
+{
+  "assemblyPath": "C:/path/target.dll",
+  "typeFullName": "MyApp.Licensing",
+  "methodName": "IsValid",
+  "source": "public bool IsValid(string key) { return key != null && key.Length > 0; }"
 }
 ```
 

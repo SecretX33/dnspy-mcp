@@ -2,11 +2,18 @@ using System.Collections.Concurrent;
 using System.Reflection.Metadata.Ecma335;
 using System.Text;
 using dnlib.DotNet;
+using dnlib.DotNet.Emit;
 using ICSharpCode.Decompiler;
 using ICSharpCode.Decompiler.CSharp;
 using ICSharpCode.Decompiler.TypeSystem;
 
 namespace DnSpyMcpServer.Services;
+
+internal enum OpcodeEditMode
+{
+    Overwrite,
+    Append
+}
 
 internal sealed class AssemblyAnalysisService
 {
@@ -206,38 +213,28 @@ internal sealed class AssemblyAnalysisService
     public string PatchReplaceStringLiteral(string assemblyPath, string methodDefToken, string ilOffset, string newText,
         bool inPlace = false, string? outputPath = null)
     {
-        var sourcePath = NormalizePath(assemblyPath);
-        if (!File.Exists(sourcePath))
-            throw new FileNotFoundException($"Assembly not found: {sourcePath}");
+        return RunModuleEdit(assemblyPath, inPlace, outputPath, "Patch applied: replace string literal", module =>
+        {
+            var method = ResolveMethodByToken(module, methodDefToken);
+            if (!method.HasBody || method.Body is null)
+                throw new InvalidOperationException($"Method has no IL body: {methodDefToken}");
 
-        var destinationPath = ResolvePatchDestination(sourcePath, inPlace, outputPath);
-        var backupPath = BuildBackupPath(sourcePath);
-        File.Copy(sourcePath, backupPath, overwrite: false);
+            var offset = ParseIlOffset(ilOffset);
+            var instruction = method.Body.Instructions.FirstOrDefault(i => i.Offset == offset)
+                ?? throw new InvalidOperationException($"IL offset not found in method {methodDefToken}: IL_{offset:X4}");
 
-        using var module = ModuleDefMD.Load(sourcePath);
-        var method = ResolveMethodByToken(module, methodDefToken);
-        if (!method.HasBody || method.Body is null)
-            throw new InvalidOperationException($"Method has no IL body: {methodDefToken}");
+            if (instruction.Operand is not string oldText)
+                throw new InvalidOperationException($"Instruction at IL_{offset:X4} is not a string literal (ldstr).");
 
-        var offset = ParseIlOffset(ilOffset);
-        var instruction = method.Body.Instructions.FirstOrDefault(i => i.Offset == offset)
-            ?? throw new InvalidOperationException($"IL offset not found in method {methodDefToken}: IL_{offset:X4}");
-
-        if (instruction.Operand is not string oldText)
-            throw new InvalidOperationException($"Instruction at IL_{offset:X4} is not a string literal (ldstr).");
-
-        instruction.Operand = newText;
-        module.Write(destinationPath);
-
-        return string.Join(Environment.NewLine,
-            "Patch applied: replace string literal",
-            $"source: {sourcePath}",
-            $"backup: {backupPath}",
-            $"output: {destinationPath}",
-            $"method: {FormatToken(method.MDToken.Raw)}",
-            $"offset: IL_{offset:X4}",
-            $"old: \"{oldText}\"",
-            $"new: \"{newText}\"");
+            instruction.Operand = newText;
+            return new[]
+            {
+                $"method: {FormatToken(method.MDToken.Raw)}",
+                $"offset: IL_{offset:X4}",
+                $"old: \"{oldText}\"",
+                $"new: \"{newText}\""
+            };
+        });
     }
 
     public string PatchNopInstructions(string assemblyPath, string methodDefToken, string ilOffset, int count,
@@ -248,55 +245,710 @@ internal sealed class AssemblyAnalysisService
 
         try
         {
-            var sourcePath = NormalizePath(assemblyPath);
-            if (!File.Exists(sourcePath))
-                throw new FileNotFoundException($"Assembly not found: {sourcePath}");
-
-            var destinationPath = ResolvePatchDestination(sourcePath, inPlace, outputPath);
-            var backupPath = BuildBackupPath(sourcePath);
-            File.Copy(sourcePath, backupPath, overwrite: false);
-
-            using var module = ModuleDefMD.Load(sourcePath);
-            var method = ResolveMethodByToken(module, methodDefToken);
-            if (!method.HasBody || method.Body is null)
-                throw new InvalidOperationException($"Method has no IL body: {methodDefToken}");
-
-            var offset = ParseIlOffset(ilOffset);
-            var instructions = method.Body.Instructions;
-            var startIndex = -1;
-            for (var i = 0; i < instructions.Count; i++)
+            return RunModuleEdit(assemblyPath, inPlace, outputPath, "Patch applied: NOP instructions", module =>
             {
-                if (instructions[i].Offset == offset)
+                var method = ResolveMethodByToken(module, methodDefToken);
+                if (!method.HasBody || method.Body is null)
+                    throw new InvalidOperationException($"Method has no IL body: {methodDefToken}");
+
+                var offset = ParseIlOffset(ilOffset);
+                var instructions = method.Body.Instructions;
+                var startIndex = IndexOfOffset(instructions, offset);
+                if (startIndex < 0)
+                    throw new InvalidOperationException($"IL offset not found in method {methodDefToken}: IL_{offset:X4}");
+
+                var end = Math.Min(startIndex + count, instructions.Count);
+                for (var i = startIndex; i < end; i++)
+                    instructions[i] = new Instruction(OpCodes.Nop);
+
+                return new[]
                 {
-                    startIndex = i;
-                    break;
-                }
-            }
-
-            if (startIndex < 0)
-                throw new InvalidOperationException($"IL offset not found in method {methodDefToken}: IL_{offset:X4}");
-
-            var end = Math.Min(startIndex + count, instructions.Count);
-            for (var i = startIndex; i < end; i++)
-            {
-                instructions[i] = new dnlib.DotNet.Emit.Instruction(dnlib.DotNet.Emit.OpCodes.Nop);
-            }
-
-            module.Write(destinationPath);
-
-            return string.Join(Environment.NewLine,
-                "Patch applied: NOP instructions",
-                $"source: {sourcePath}",
-                $"backup: {backupPath}",
-                $"output: {destinationPath}",
-                $"method: {FormatToken(method.MDToken.Raw)}",
-                $"startOffset: IL_{offset:X4}",
-                $"count: {end - startIndex}");
+                    $"method: {FormatToken(method.MDToken.Raw)}",
+                    $"startOffset: IL_{offset:X4}",
+                    $"count: {end - startIndex}"
+                };
+            });
         }
         catch (Exception ex)
         {
             throw new InvalidOperationException($"Patch NOP failed: {ex.GetType().Name}: {ex.Message}", ex);
         }
+    }
+
+    public string RenameType(string assemblyPath, string typeFullName, string newName, string? newNamespace,
+        bool inPlace = false, string? outputPath = null)
+    {
+        if (string.IsNullOrWhiteSpace(newName))
+            throw new InvalidOperationException("newName cannot be empty.");
+
+        return RunModuleEdit(assemblyPath, inPlace, outputPath, "Rename applied: type", module =>
+        {
+            var type = FindType(module, typeFullName);
+            var oldFullName = type.FullName;
+            type.Name = newName;
+            if (newNamespace is not null)
+                type.Namespace = newNamespace;
+
+            return new[]
+            {
+                $"typeDef: {FormatToken(type.MDToken.Raw)}",
+                $"old: {oldFullName}",
+                $"new: {type.FullName}"
+            };
+        });
+    }
+
+    public string RenameMethod(string assemblyPath, string typeFullName, string methodName, string newName,
+        string[]? parameterTypeNames, bool inPlace = false, string? outputPath = null)
+    {
+        if (string.IsNullOrWhiteSpace(newName))
+            throw new InvalidOperationException("newName cannot be empty.");
+
+        return RunModuleEdit(assemblyPath, inPlace, outputPath, "Rename applied: method", module =>
+        {
+            var type = FindType(module, typeFullName);
+            var method = FindMethod(type, methodName, parameterTypeNames);
+            var oldSig = RenderMethodSignature(method);
+            method.Name = newName;
+
+            return new[]
+            {
+                $"typeDef: {FormatToken(type.MDToken.Raw)}",
+                $"methodDef: {FormatToken(method.MDToken.Raw)}",
+                $"old: {oldSig}",
+                $"new: {RenderMethodSignature(method)}"
+            };
+        });
+    }
+
+    public string RenameNamespace(string assemblyPath, string oldNamespace, string newNamespace,
+        bool inPlace = false, string? outputPath = null)
+    {
+        return RunModuleEdit(assemblyPath, inPlace, outputPath, "Rename applied: namespace", module =>
+        {
+            var affected = module.GetTypes()
+                .Where(t => !t.IsGlobalModuleType)
+                .Where(t => string.Equals(t.Namespace, oldNamespace, StringComparison.Ordinal))
+                .ToArray();
+
+            if (affected.Length == 0)
+                throw new InvalidOperationException($"No types found in namespace: '{oldNamespace}'");
+
+            foreach (var type in affected)
+                type.Namespace = newNamespace;
+
+            return new[]
+            {
+                $"oldNamespace: {oldNamespace}",
+                $"newNamespace: {newNamespace}",
+                $"typesUpdated: {affected.Length}"
+            };
+        });
+    }
+
+    public string SetFunctionOpcodes(string assemblyPath, string typeFullName, string methodName,
+        string[]? parameterTypeNames, string[] ilOpcodes, int index, OpcodeEditMode mode,
+        bool inPlace = false, string? outputPath = null)
+    {
+        if (ilOpcodes is null || ilOpcodes.Length == 0)
+            throw new InvalidOperationException("ilOpcodes cannot be empty.");
+        if (index < 0)
+            throw new InvalidOperationException("index must be >= 0.");
+
+        return RunModuleEdit(assemblyPath, inPlace, outputPath, $"IL edit applied ({mode})", module =>
+        {
+            var type = FindType(module, typeFullName);
+            var method = FindMethod(type, methodName, parameterTypeNames);
+            if (!method.HasBody || method.Body is null)
+                throw new InvalidOperationException($"Method has no IL body: {type.FullName}.{methodName}");
+
+            var instructions = method.Body.Instructions;
+            if (index > instructions.Count)
+                throw new InvalidOperationException($"index {index} is past the end of the method ({instructions.Count} instructions).");
+
+            var parsed = ParseInstructions(module, ilOpcodes);
+
+            if (mode == OpcodeEditMode.Overwrite)
+            {
+                var replaceCount = Math.Min(parsed.Length, instructions.Count - index);
+                for (var i = 0; i < replaceCount; i++)
+                    instructions[index + i] = parsed[i];
+                for (var i = replaceCount; i < parsed.Length; i++)
+                    instructions.Insert(index + i, parsed[i]);
+            }
+            else
+            {
+                for (var i = 0; i < parsed.Length; i++)
+                    instructions.Insert(index + i, parsed[i]);
+            }
+
+            method.Body.UpdateInstructionOffsets();
+            method.Body.KeepOldMaxStack = false;
+
+            return new[]
+            {
+                $"typeDef: {FormatToken(type.MDToken.Raw)}",
+                $"methodDef: {FormatToken(method.MDToken.Raw)}",
+                $"mode: {mode}",
+                $"index: {index}",
+                $"instructionsWritten: {parsed.Length}",
+                "-- new body --"
+            }.Concat(RenderInstructions(instructions)).ToArray();
+        });
+    }
+
+    public string OverwriteMethodBody(string assemblyPath, string typeFullName, string methodName,
+        string[]? parameterTypeNames, string[] ilOpcodes, bool inPlace = false, string? outputPath = null)
+    {
+        if (ilOpcodes is null || ilOpcodes.Length == 0)
+            throw new InvalidOperationException("ilOpcodes cannot be empty.");
+
+        return RunModuleEdit(assemblyPath, inPlace, outputPath, "IL body overwritten", module =>
+        {
+            var type = FindType(module, typeFullName);
+            var method = FindMethod(type, methodName, parameterTypeNames);
+            method.Body ??= new CilBody();
+
+            var parsed = ParseInstructions(module, ilOpcodes);
+
+            method.Body.Instructions.Clear();
+            method.Body.ExceptionHandlers.Clear();
+            foreach (var instruction in parsed)
+                method.Body.Instructions.Add(instruction);
+
+            method.Body.UpdateInstructionOffsets();
+            method.Body.KeepOldMaxStack = false;
+
+            return new[]
+            {
+                $"typeDef: {FormatToken(type.MDToken.Raw)}",
+                $"methodDef: {FormatToken(method.MDToken.Raw)}",
+                $"instructionsWritten: {parsed.Length}",
+                "-- new body --"
+            }.Concat(RenderInstructions(method.Body.Instructions)).ToArray();
+        });
+    }
+
+    private const string PatchTypeName = "__DnSpyMcpPatch";
+
+    public string UpdateMethodSource(string assemblyPath, string typeFullName, string methodName,
+        string[]? parameterTypeNames, string source, bool inPlace = false, string? outputPath = null)
+    {
+        if (string.IsNullOrWhiteSpace(source))
+            throw new InvalidOperationException("source cannot be empty.");
+
+        var referenceRoot = NormalizePath(assemblyPath);
+
+        return RunModuleEdit(assemblyPath, inPlace, outputPath, "Method source recompiled", module =>
+        {
+            var type = FindType(module, typeFullName);
+            var target = FindMethod(type, methodName, parameterTypeNames);
+
+            var compiled = CompileMethod(referenceRoot, source, out var diagnostics);
+            if (compiled is null)
+                throw new InvalidOperationException("Compilation failed:" + Environment.NewLine + diagnostics);
+
+            using var patchModule = ModuleDefMD.Load(compiled);
+            var patchType = patchModule.Types.FirstOrDefault(t => t.Name == PatchTypeName)
+                ?? throw new InvalidOperationException("Internal error: compiled patch type not found.");
+            var patchMethod = patchType.Methods.FirstOrDefault(m => string.Equals(m.Name, methodName, StringComparison.Ordinal) && m.HasBody)
+                ?? throw new InvalidOperationException($"The supplied source must declare a method named '{methodName}'.");
+
+            if (patchMethod.IsStatic != target.IsStatic)
+                throw new InvalidOperationException($"Static/instance mismatch: target {(target.IsStatic ? "is" : "is not")} static, supplied method {(patchMethod.IsStatic ? "is" : "is not")}.");
+            if (patchMethod.MethodSig.Params.Count != target.MethodSig.Params.Count)
+                throw new InvalidOperationException($"Parameter count mismatch: target has {target.MethodSig.Params.Count}, supplied method has {patchMethod.MethodSig.Params.Count}.");
+
+            CopyMethodBody(module, patchMethod, target);
+
+            return new[]
+            {
+                $"typeDef: {FormatToken(type.MDToken.Raw)}",
+                $"methodDef: {FormatToken(target.MDToken.Raw)}",
+                $"localsCopied: {target.Body!.Variables.Count}",
+                $"instructionsCopied: {target.Body.Instructions.Count}",
+                "-- new body --"
+            }.Concat(RenderInstructions(target.Body.Instructions)).ToArray();
+        });
+    }
+
+    private static byte[]? CompileMethod(string referenceRoot, string source, out string diagnostics)
+    {
+        var wrapper = $$"""
+            using System;
+            using System.Collections;
+            using System.Collections.Generic;
+            using System.Globalization;
+            using System.Linq;
+            using System.Text;
+
+            public class {{PatchTypeName}}
+            {
+            {{source}}
+            }
+            """;
+
+        var tree = Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree.ParseText(wrapper);
+        var compilation = Microsoft.CodeAnalysis.CSharp.CSharpCompilation.Create(
+            assemblyName: "__DnSpyMcpPatchAsm",
+            syntaxTrees: new[] { tree },
+            references: GatherReferences(referenceRoot),
+            options: new Microsoft.CodeAnalysis.CSharp.CSharpCompilationOptions(
+                Microsoft.CodeAnalysis.OutputKind.DynamicallyLinkedLibrary,
+                allowUnsafe: true,
+                optimizationLevel: Microsoft.CodeAnalysis.OptimizationLevel.Release));
+
+        using var ms = new MemoryStream();
+        var result = compilation.Emit(ms);
+        if (!result.Success)
+        {
+            diagnostics = string.Join(Environment.NewLine, result.Diagnostics
+                .Where(d => d.Severity == Microsoft.CodeAnalysis.DiagnosticSeverity.Error)
+                .Select(d => d.ToString()));
+            return null;
+        }
+
+        diagnostics = string.Empty;
+        return ms.ToArray();
+    }
+
+    private static List<Microsoft.CodeAnalysis.MetadataReference> GatherReferences(string referenceRoot)
+    {
+        var references = new List<Microsoft.CodeAnalysis.MetadataReference>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Host runtime reference set (this process runs on the same net8.0 shared framework).
+        if (AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES") is string tpa)
+        {
+            foreach (var path in tpa.Split(Path.PathSeparator))
+            {
+                if (path.Length > 0 && File.Exists(path) && seen.Add(Path.GetFileName(path)))
+                    references.Add(Microsoft.CodeAnalysis.MetadataReference.CreateFromFile(path));
+            }
+        }
+
+        // The target assembly and its neighbours, so the source can call into the app's own types.
+        // Framework assemblies already provided by the host win (deduped by file name) to avoid clashes.
+        var directory = Path.GetDirectoryName(referenceRoot);
+        if (directory is not null && Directory.Exists(directory))
+        {
+            foreach (var file in Directory.EnumerateFiles(directory, "*.dll").Concat(Directory.EnumerateFiles(directory, "*.exe")))
+            {
+                if (!seen.Add(Path.GetFileName(file)))
+                    continue;
+                try { references.Add(Microsoft.CodeAnalysis.MetadataReference.CreateFromFile(file)); }
+                catch { /* skip native/unreadable files */ }
+            }
+        }
+
+        return references;
+    }
+
+    // Clones a compiled method body into the target method, importing every type/method/field reference into the
+    // target module and remapping locals, parameters, branch targets and exception handlers.
+    private static void CopyMethodBody(ModuleDefMD targetModule, MethodDef source, MethodDef target)
+    {
+        var importer = new Importer(targetModule,
+            ImporterOptions.TryToUseTypeDefs | ImporterOptions.TryToUseMethodDefs | ImporterOptions.TryToUseFieldDefs);
+
+        var body = new CilBody { InitLocals = source.Body.InitLocals };
+
+        var localMap = new Dictionary<Local, Local>();
+        foreach (var local in source.Body.Variables)
+        {
+            var clonedLocal = new Local(importer.Import(local.Type));
+            localMap[local] = clonedLocal;
+            body.Variables.Add(clonedLocal);
+        }
+
+        var instructionMap = new Dictionary<Instruction, Instruction>();
+        foreach (var instruction in source.Body.Instructions)
+        {
+            var clone = new Instruction(instruction.OpCode) { Operand = instruction.Operand };
+            instructionMap[instruction] = clone;
+            body.Instructions.Add(clone);
+        }
+
+        foreach (var instruction in body.Instructions)
+        {
+            switch (instruction.OpCode.OperandType)
+            {
+                case OperandType.InlineType:
+                    instruction.Operand = ImportType(targetModule, importer, (ITypeDefOrRef)instruction.Operand);
+                    break;
+                case OperandType.InlineMethod:
+                    instruction.Operand = ImportMethod(targetModule, importer, (dnlib.DotNet.IMethod)instruction.Operand);
+                    break;
+                case OperandType.InlineField:
+                    instruction.Operand = ImportField(targetModule, importer, (dnlib.DotNet.IField)instruction.Operand);
+                    break;
+                case OperandType.InlineTok:
+                    instruction.Operand = ImportTokenOperand(targetModule, importer, instruction.Operand);
+                    break;
+                case OperandType.InlineBrTarget:
+                case OperandType.ShortInlineBrTarget:
+                    instruction.Operand = instructionMap[(Instruction)instruction.Operand];
+                    break;
+                case OperandType.InlineSwitch:
+                    instruction.Operand = ((Instruction[])instruction.Operand).Select(i => instructionMap[i]).ToArray();
+                    break;
+                case OperandType.InlineVar:
+                case OperandType.ShortInlineVar:
+                    if (instruction.Operand is Local local)
+                        instruction.Operand = localMap[local];
+                    else if (instruction.Operand is Parameter parameter)
+                        instruction.Operand = target.Parameters[parameter.Index];
+                    break;
+            }
+        }
+
+        foreach (var handler in source.Body.ExceptionHandlers)
+        {
+            body.ExceptionHandlers.Add(new ExceptionHandler(handler.HandlerType)
+            {
+                CatchType = handler.CatchType is null ? null : importer.Import(handler.CatchType),
+                TryStart = MapInstruction(instructionMap, handler.TryStart),
+                TryEnd = MapInstruction(instructionMap, handler.TryEnd),
+                HandlerStart = MapInstruction(instructionMap, handler.HandlerStart),
+                HandlerEnd = MapInstruction(instructionMap, handler.HandlerEnd),
+                FilterStart = MapInstruction(instructionMap, handler.FilterStart)
+            });
+        }
+
+        body.UpdateInstructionOffsets();
+        body.KeepOldMaxStack = false;
+        target.Body = body;
+    }
+
+    private static Instruction? MapInstruction(IReadOnlyDictionary<Instruction, Instruction> map, Instruction? instruction)
+        => instruction is null ? null : map[instruction];
+
+    private static object ImportTokenOperand(ModuleDefMD targetModule, Importer importer, object operand) => operand switch
+    {
+        ITypeDefOrRef type => ImportType(targetModule, importer, type),
+        MemberRef member => member.IsFieldRef
+            ? ImportField(targetModule, importer, member)
+            : ImportMethod(targetModule, importer, member),
+        FieldDef field => ImportField(targetModule, importer, field),
+        MethodSpec spec => ImportMethod(targetModule, importer, spec),
+        MethodDef method => ImportMethod(targetModule, importer, method),
+        _ => operand
+    };
+
+    // A reference emitted by the throwaway compiled assembly may point back at a type in the module we are
+    // patching. Resolve those to the module's own definitions; only genuinely external (e.g. BCL) references
+    // go through the importer, which would otherwise leave a dangling ref to the compiled patch assembly.
+    private static ITypeDefOrRef ImportType(ModuleDefMD targetModule, Importer importer, ITypeDefOrRef type)
+        => targetModule.Find(type.FullName, false) ?? importer.Import(type);
+
+    private static dnlib.DotNet.IMethod ImportMethod(ModuleDefMD targetModule, Importer importer, dnlib.DotNet.IMethod method)
+    {
+        var localType = method.DeclaringType is null ? null : targetModule.Find(method.DeclaringType.FullName, false);
+        var local = localType is null ? null : FindMatchingMethod(localType, method);
+        return local ?? importer.Import(method);
+    }
+
+    private static dnlib.DotNet.IField ImportField(ModuleDefMD targetModule, Importer importer, dnlib.DotNet.IField field)
+    {
+        var localType = field.DeclaringType is null ? null : targetModule.Find(field.DeclaringType.FullName, false);
+        var local = localType?.Fields.FirstOrDefault(f => string.Equals(f.Name, field.Name, StringComparison.Ordinal));
+        return local ?? importer.Import(field);
+    }
+
+    private static MethodDef? FindMatchingMethod(TypeDef type, dnlib.DotNet.IMethod method)
+    {
+        var signature = method.MethodSig;
+        MethodDef? byNameOnly = null;
+        foreach (var candidate in type.Methods)
+        {
+            if (!string.Equals(candidate.Name, method.Name, StringComparison.Ordinal))
+                continue;
+            byNameOnly ??= candidate;
+
+            if (signature is null || candidate.MethodSig.Params.Count != signature.Params.Count)
+                continue;
+
+            var match = true;
+            for (var i = 0; i < signature.Params.Count; i++)
+            {
+                if (!string.Equals(candidate.MethodSig.Params[i].FullName, signature.Params[i].FullName, StringComparison.Ordinal))
+                {
+                    match = false;
+                    break;
+                }
+            }
+
+            if (match)
+                return candidate;
+        }
+
+        return byNameOnly;
+    }
+
+    // Assembles opcode strings ("ldstr \"hi\"", "call System.Console::WriteLine(System.String)", "br 4") into
+    // dnlib instructions. Supported operands: none, string literal, ldc numeric, call/callvirt/newobj (methods),
+    // ld/st fields, type operands, and branch targets addressed by 0-based instruction index. Anything else throws.
+    private static Instruction[] ParseInstructions(ModuleDefMD module, string[] ilOpcodes)
+    {
+        var importer = new Importer(module);
+        var result = new List<Instruction>();
+        var branchTargets = new List<(int InstructionIndex, int TargetIndex)>();
+
+        foreach (var raw in ilOpcodes)
+        {
+            var line = raw?.Trim();
+            if (string.IsNullOrEmpty(line))
+                continue;
+
+            var split = SplitMnemonic(line);
+            var mnemonic = split.Mnemonic;
+            var operandText = split.Operand;
+
+            if (!OpcodeMap.TryGetValue(mnemonic, out var opcode))
+                throw new InvalidOperationException($"Unknown IL opcode '{mnemonic}' in line: {raw}");
+
+            var instruction = opcode.OperandType switch
+            {
+                OperandType.InlineNone => Instruction.Create(opcode),
+                OperandType.InlineString => Instruction.Create(opcode, ParseStringOperand(operandText)),
+                OperandType.ShortInlineI => Instruction.Create(opcode, ParseSByte(operandText)),
+                OperandType.InlineI => Instruction.Create(opcode, ParseInt(operandText)),
+                OperandType.InlineI8 => Instruction.Create(opcode, ParseLong(operandText)),
+                OperandType.ShortInlineR => Instruction.Create(opcode, ParseFloat(operandText)),
+                OperandType.InlineR => Instruction.Create(opcode, ParseDouble(operandText)),
+                OperandType.InlineMethod => Instruction.Create(opcode, ResolveMethodOperand(module, importer, operandText)),
+                OperandType.InlineField => Instruction.Create(opcode, ResolveFieldOperand(module, importer, operandText)),
+                OperandType.InlineType => Instruction.Create(opcode, ResolveTypeOperand(module, importer, operandText)),
+                OperandType.InlineBrTarget or OperandType.ShortInlineBrTarget => new Instruction(opcode),
+                _ => throw new InvalidOperationException(
+                    $"Unsupported operand type '{opcode.OperandType}' for opcode '{mnemonic}'. Supported: no-operand opcodes, ldstr, ldc.i4/i8/r4/r8, call/callvirt/newobj, ld/st fields, type operands, and branch targets (by instruction index).")
+            };
+
+            if (opcode.OperandType is OperandType.InlineBrTarget or OperandType.ShortInlineBrTarget)
+                branchTargets.Add((result.Count, ParseInt(operandText)));
+
+            result.Add(instruction);
+        }
+
+        foreach (var (instructionIndex, targetIndex) in branchTargets)
+        {
+            if (targetIndex < 0 || targetIndex >= result.Count)
+                throw new InvalidOperationException($"Branch target index {targetIndex} is out of range (valid: 0..{result.Count - 1}).");
+            result[instructionIndex].Operand = result[targetIndex];
+        }
+
+        return result.ToArray();
+    }
+
+    private static (string Mnemonic, string Operand) SplitMnemonic(string line)
+    {
+        for (var i = 0; i < line.Length; i++)
+        {
+            if (char.IsWhiteSpace(line[i]))
+                return (line[..i], line[(i + 1)..].Trim());
+        }
+
+        return (line, string.Empty);
+    }
+
+    private static ITypeDefOrRef ResolveTypeOperand(ModuleDefMD module, Importer importer, string typeName)
+    {
+        typeName = typeName.Trim();
+        var typeDef = module.Find(typeName, false) ?? module.Find(typeName, true);
+        if (typeDef is not null)
+            return typeDef;
+
+        var reflectionType = Type.GetType(typeName, throwOnError: false);
+        if (reflectionType is not null)
+            return importer.Import(reflectionType);
+
+        throw new InvalidOperationException($"Could not resolve type operand '{typeName}'. Use a type defined in the target module or a resolvable BCL type (e.g. System.String).");
+    }
+
+    private static dnlib.DotNet.IMethod ResolveMethodOperand(ModuleDefMD module, Importer importer, string operandText)
+    {
+        var (typeName, memberName, parameterTypes) = SplitMemberReference(operandText, "method");
+
+        var typeDef = module.Find(typeName, false) ?? module.Find(typeName, true);
+        if (typeDef is not null)
+        {
+            var method = typeDef.Methods.FirstOrDefault(m =>
+                string.Equals(m.Name, memberName, StringComparison.Ordinal) &&
+                (parameterTypes is null || SignatureMatches(m, parameterTypes)));
+            if (method is not null)
+                return method;
+        }
+
+        var reflectionType = Type.GetType(typeName, throwOnError: false);
+        if (reflectionType is not null)
+        {
+            var method = FindReflectionMethod(reflectionType, memberName, parameterTypes);
+            if (method is not null)
+                return importer.Import(method);
+        }
+
+        throw new InvalidOperationException($"Could not resolve method operand '{operandText}'. Expected 'Type::Method' or 'Type::Method(ParamType, ...)'.");
+    }
+
+    private static dnlib.DotNet.IField ResolveFieldOperand(ModuleDefMD module, Importer importer, string operandText)
+    {
+        var (typeName, memberName, _) = SplitMemberReference(operandText, "field");
+
+        var typeDef = module.Find(typeName, false) ?? module.Find(typeName, true);
+        if (typeDef is not null)
+        {
+            var field = typeDef.Fields.FirstOrDefault(f => string.Equals(f.Name, memberName, StringComparison.Ordinal));
+            if (field is not null)
+                return field;
+        }
+
+        var reflectionType = Type.GetType(typeName, throwOnError: false);
+        if (reflectionType is not null)
+        {
+            var field = reflectionType.GetField(memberName,
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic |
+                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Instance);
+            if (field is not null)
+                return importer.Import(field);
+        }
+
+        throw new InvalidOperationException($"Could not resolve field operand '{operandText}'. Expected 'Type::Field'.");
+    }
+
+    private static (string TypeName, string MemberName, string[]? ParameterTypes) SplitMemberReference(string operandText, string kind)
+    {
+        operandText = operandText.Trim();
+        var separator = operandText.IndexOf("::", StringComparison.Ordinal);
+        if (separator < 0)
+            throw new InvalidOperationException($"The {kind} operand must be 'Type::{char.ToUpperInvariant(kind[0])}{kind[1..]}': '{operandText}'");
+
+        var left = operandText[..separator].Trim();
+        var right = operandText[(separator + 2)..].Trim();
+
+        // Drop an optional leading return type: "System.Void System.Console::WriteLine".
+        var typeName = left.Contains(' ') ? left[(left.LastIndexOf(' ') + 1)..] : left;
+
+        string[]? parameterTypes = null;
+        var paren = right.IndexOf('(');
+        if (paren >= 0)
+        {
+            var inside = right[(paren + 1)..].TrimEnd(')').Trim();
+            parameterTypes = inside.Length == 0
+                ? Array.Empty<string>()
+                : inside.Split(',').Select(s => NormalizeTypeName(s.Trim())).ToArray();
+            right = right[..paren].Trim();
+        }
+
+        return (typeName, right, parameterTypes);
+    }
+
+    private static bool SignatureMatches(MethodDef method, string[] parameterTypes)
+    {
+        var sigParams = method.MethodSig?.Params;
+        if (sigParams is null || sigParams.Count != parameterTypes.Length)
+            return false;
+
+        for (var i = 0; i < sigParams.Count; i++)
+        {
+            if (!string.Equals(NormalizeTypeName(sigParams[i].FullName), parameterTypes[i], StringComparison.OrdinalIgnoreCase))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static System.Reflection.MethodBase? FindReflectionMethod(Type type, string methodName, string[]? parameterTypes)
+    {
+        const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic |
+                                                     System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Instance;
+
+        IEnumerable<System.Reflection.MethodBase> candidates = string.Equals(methodName, ".ctor", StringComparison.Ordinal)
+            ? type.GetConstructors(flags)
+            : type.GetMethods(flags).Where(m => string.Equals(m.Name, methodName, StringComparison.Ordinal));
+
+        var list = candidates.ToArray();
+        if (parameterTypes is not null)
+            list = list.Where(m => m.GetParameters().Length == parameterTypes.Length &&
+                                   m.GetParameters().Select(p => NormalizeTypeName(p.ParameterType.FullName ?? p.ParameterType.Name))
+                                    .SequenceEqual(parameterTypes, StringComparer.OrdinalIgnoreCase)).ToArray();
+
+        return list.Length == 1 ? list[0] : list.FirstOrDefault();
+    }
+
+    private static string ParseStringOperand(string text)
+    {
+        text = text.Trim();
+        if (text.Length >= 2 && text[0] == '"' && text[^1] == '"')
+            text = text[1..^1];
+
+        var sb = new StringBuilder(text.Length);
+        for (var i = 0; i < text.Length; i++)
+        {
+            if (text[i] == '\\' && i + 1 < text.Length)
+            {
+                var next = text[++i];
+                sb.Append(next switch
+                {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    '"' => '"',
+                    '\\' => '\\',
+                    _ => next
+                });
+            }
+            else
+            {
+                sb.Append(text[i]);
+            }
+        }
+
+        return sb.ToString();
+    }
+
+    private static sbyte ParseSByte(string text) =>
+        sbyte.TryParse(text.Trim(), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var v)
+            ? v : throw new InvalidOperationException($"Expected an sbyte operand, got '{text}'.");
+
+    private static int ParseInt(string text) =>
+        int.TryParse(text.Trim(), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var v)
+            ? v : throw new InvalidOperationException($"Expected an int operand, got '{text}'.");
+
+    private static long ParseLong(string text) =>
+        long.TryParse(text.Trim(), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var v)
+            ? v : throw new InvalidOperationException($"Expected a long operand, got '{text}'.");
+
+    private static float ParseFloat(string text) =>
+        float.TryParse(text.Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var v)
+            ? v : throw new InvalidOperationException($"Expected a float operand, got '{text}'.");
+
+    private static double ParseDouble(string text) =>
+        double.TryParse(text.Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var v)
+            ? v : throw new InvalidOperationException($"Expected a double operand, got '{text}'.");
+
+    private static IEnumerable<string> RenderInstructions(IEnumerable<Instruction> instructions)
+    {
+        foreach (var instruction in instructions)
+        {
+            var operand = instruction.Operand is null ? string.Empty : $" {instruction.Operand}";
+            yield return $"IL_{instruction.Offset:X4}: {instruction.OpCode}{operand}";
+        }
+    }
+
+    private static readonly Dictionary<string, OpCode> OpcodeMap = BuildOpcodeMap();
+
+    private static Dictionary<string, OpCode> BuildOpcodeMap()
+    {
+        var map = new Dictionary<string, OpCode>(StringComparer.OrdinalIgnoreCase);
+        foreach (var field in typeof(OpCodes).GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static))
+        {
+            if (field.FieldType != typeof(OpCode))
+                continue;
+            if (field.GetValue(null) is OpCode opcode && !string.IsNullOrEmpty(opcode.Name))
+                map[opcode.Name] = opcode;
+        }
+
+        return map;
     }
 
     private LoadedAssembly GetOrLoad(string assemblyPath)
@@ -316,6 +968,59 @@ internal sealed class AssemblyAnalysisService
             var decompiler = new CSharpDecompiler(path, settings);
             return new LoadedAssembly(path, module, decompiler);
         });
+    }
+
+    private void InvalidateCache(string assemblyPath)
+    {
+        var normalized = NormalizePath(assemblyPath);
+        if (_cache.TryRemove(normalized, out var entry))
+            entry.Module.Dispose();
+    }
+
+    // Shared write path for every mutating tool: always back up first, load the module from an in-memory
+    // copy (so an in-place write never fights a file lock), run the edit, then write to the destination.
+    private string RunModuleEdit(string assemblyPath, bool inPlace, string? outputPath, string title,
+        Func<ModuleDefMD, IEnumerable<string>> mutate)
+    {
+        var sourcePath = NormalizePath(assemblyPath);
+        if (!File.Exists(sourcePath))
+            throw new FileNotFoundException($"Assembly not found: {sourcePath}");
+
+        var destinationPath = ResolvePatchDestination(sourcePath, inPlace, outputPath);
+        var backupPath = BuildBackupPath(sourcePath);
+        File.Copy(sourcePath, backupPath, overwrite: false);
+
+        InvalidateCache(sourcePath);
+        if (!string.Equals(sourcePath, destinationPath, StringComparison.OrdinalIgnoreCase))
+            InvalidateCache(destinationPath);
+
+        var detail = new List<string>();
+        using (var module = ModuleDefMD.Load(File.ReadAllBytes(sourcePath)))
+        {
+            detail.AddRange(mutate(module));
+            module.Write(destinationPath);
+        }
+
+        var lines = new List<string>
+        {
+            title,
+            $"source: {sourcePath}",
+            $"backup: {backupPath}",
+            $"output: {destinationPath}"
+        };
+        lines.AddRange(detail);
+        return string.Join(Environment.NewLine, lines);
+    }
+
+    private static int IndexOfOffset(IList<Instruction> instructions, int offset)
+    {
+        for (var i = 0; i < instructions.Count; i++)
+        {
+            if (instructions[i].Offset == offset)
+                return i;
+        }
+
+        return -1;
     }
 
     private static TypeDef FindType(ModuleDefMD module, string typeFullName)
@@ -433,6 +1138,10 @@ internal sealed class AssemblyAnalysisService
     {
         var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
         var candidate = $"{sourcePath}.{timestamp}.bak";
+        var counter = 1;
+        while (File.Exists(candidate))
+            candidate = $"{sourcePath}.{timestamp}_{counter++}.bak";
+
         return candidate;
     }
 

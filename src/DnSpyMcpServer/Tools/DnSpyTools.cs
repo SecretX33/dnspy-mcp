@@ -242,6 +242,240 @@ internal static class DnSpyTools
         });
     }
 
+    [McpTool("rename_type", "Rename a type (and optionally move its namespace), writing a patched assembly. Always creates a backup first.")]
+    public static ToolCallResult RenameType(
+        ToolContext ctx,
+        [ToolParam("Path to target assembly (.exe/.dll).")]
+        string assemblyPath,
+        [ToolParam("Full name of the type to rename.")]
+        string typeFullName,
+        [ToolParam("New simple type name (without namespace).")]
+        string newName,
+        [ToolParam("Optional new namespace. If omitted, the namespace is unchanged.")]
+        string? newNamespace = null,
+        [ToolParam("Patch in place (default false).")]
+        bool inPlace = false,
+        [ToolParam("Output path when not inPlace. Optional.")]
+        string? outputPath = null)
+    {
+        try
+        {
+            var result = ctx.Analysis.RenameType(assemblyPath, typeFullName, newName, newNamespace, inPlace, outputPath);
+            return new ToolCallResult(result, new
+            {
+                assemblyPath,
+                typeFullName,
+                newName,
+                newNamespace,
+                inPlace,
+                outputPath,
+                backupAlwaysCreated = true,
+                result
+            });
+        }
+        catch (Exception ex)
+        {
+            return ErrorResult(ex);
+        }
+    }
+
+    [McpTool("rename_method", "Rename a method, writing a patched assembly. Always creates a backup first.")]
+    public static ToolCallResult RenameMethod(
+        ToolContext ctx,
+        [ToolParam("Path to target assembly (.exe/.dll).")]
+        string assemblyPath,
+        [ToolParam("Full name of the declaring type.")]
+        string typeFullName,
+        [ToolParam("Current method name.")]
+        string methodName,
+        [ToolParam("New method name.")]
+        string newName,
+        [ToolParam("Optional parameter type list to pick a specific overload.")]
+        string[]? parameterTypeNames = null,
+        [ToolParam("Patch in place (default false).")]
+        bool inPlace = false,
+        [ToolParam("Output path when not inPlace. Optional.")]
+        string? outputPath = null)
+    {
+        try
+        {
+            var result = ctx.Analysis.RenameMethod(assemblyPath, typeFullName, methodName, newName, parameterTypeNames, inPlace, outputPath);
+            return new ToolCallResult(result, new
+            {
+                assemblyPath,
+                typeFullName,
+                methodName,
+                newName,
+                parameterTypeNames,
+                inPlace,
+                outputPath,
+                backupAlwaysCreated = true,
+                result
+            });
+        }
+        catch (Exception ex)
+        {
+            return ErrorResult(ex);
+        }
+    }
+
+    [McpTool("rename_namespace", "Rename a namespace across all its types, writing a patched assembly. Always creates a backup first.")]
+    public static ToolCallResult RenameNamespace(
+        ToolContext ctx,
+        [ToolParam("Path to target assembly (.exe/.dll).")]
+        string assemblyPath,
+        [ToolParam("Existing namespace to rename.")]
+        string oldNamespace,
+        [ToolParam("New namespace.")]
+        string newNamespace,
+        [ToolParam("Patch in place (default false).")]
+        bool inPlace = false,
+        [ToolParam("Output path when not inPlace. Optional.")]
+        string? outputPath = null)
+    {
+        try
+        {
+            var result = ctx.Analysis.RenameNamespace(assemblyPath, oldNamespace, newNamespace, inPlace, outputPath);
+            return new ToolCallResult(result, new
+            {
+                assemblyPath,
+                oldNamespace,
+                newNamespace,
+                inPlace,
+                outputPath,
+                backupAlwaysCreated = true,
+                result
+            });
+        }
+        catch (Exception ex)
+        {
+            return ErrorResult(ex);
+        }
+    }
+
+    [McpTool("set_function_opcodes", "Edit a method's IL at a 0-based instruction index. mode=Overwrite replaces from the index, mode=Append inserts. Always creates a backup first.")]
+    public static ToolCallResult SetFunctionOpcodes(
+        ToolContext ctx,
+        [ToolParam("Path to target assembly (.exe/.dll).")]
+        string assemblyPath,
+        [ToolParam("Full name of the declaring type.")]
+        string typeFullName,
+        [ToolParam("Method name.")]
+        string methodName,
+        [ToolParam("IL opcode lines, e.g. [\"ldstr \\\"hi\\\"\", \"call System.Void System.Console::WriteLine(System.String)\", \"ret\"]. Branch operands are a 0-based index into this list.")]
+        string[] ilOpcodes,
+        [ToolParam("0-based instruction index to edit at.")]
+        int index,
+        [ToolParam("Overwrite (replace from index) or Append (insert at index).")]
+        OpcodeEditMode mode = OpcodeEditMode.Overwrite,
+        [ToolParam("Optional parameter type list to pick a specific overload.")]
+        string[]? parameterTypeNames = null,
+        [ToolParam("Patch in place (default false).")]
+        bool inPlace = false,
+        [ToolParam("Output path when not inPlace. Optional.")]
+        string? outputPath = null)
+    {
+        try
+        {
+            var result = ctx.Analysis.SetFunctionOpcodes(assemblyPath, typeFullName, methodName, parameterTypeNames, ilOpcodes, index, mode, inPlace, outputPath);
+            return new ToolCallResult(result, new
+            {
+                assemblyPath,
+                typeFullName,
+                methodName,
+                mode = mode.ToString(),
+                index,
+                parameterTypeNames,
+                inPlace,
+                outputPath,
+                backupAlwaysCreated = true,
+                result
+            });
+        }
+        catch (Exception ex)
+        {
+            return ErrorResult(ex);
+        }
+    }
+
+    [McpTool("overwrite_method_body", "Clear a method body and rebuild it entirely from IL opcode lines. Always creates a backup first.")]
+    public static ToolCallResult OverwriteMethodBody(
+        ToolContext ctx,
+        [ToolParam("Path to target assembly (.exe/.dll).")]
+        string assemblyPath,
+        [ToolParam("Full name of the declaring type.")]
+        string typeFullName,
+        [ToolParam("Method name.")]
+        string methodName,
+        [ToolParam("Full IL opcode lines for the new body (must end with a return). Branch operands are a 0-based index into this list.")]
+        string[] ilOpcodes,
+        [ToolParam("Optional parameter type list to pick a specific overload.")]
+        string[]? parameterTypeNames = null,
+        [ToolParam("Patch in place (default false).")]
+        bool inPlace = false,
+        [ToolParam("Output path when not inPlace. Optional.")]
+        string? outputPath = null)
+    {
+        try
+        {
+            var result = ctx.Analysis.OverwriteMethodBody(assemblyPath, typeFullName, methodName, parameterTypeNames, ilOpcodes, inPlace, outputPath);
+            return new ToolCallResult(result, new
+            {
+                assemblyPath,
+                typeFullName,
+                methodName,
+                parameterTypeNames,
+                inPlace,
+                outputPath,
+                backupAlwaysCreated = true,
+                result
+            });
+        }
+        catch (Exception ex)
+        {
+            return ErrorResult(ex);
+        }
+    }
+
+    [McpTool("update_method_source", "Replace a method body by compiling a C# method with Roslyn and splicing its IL in. The declared method name must match. Always creates a backup first.")]
+    public static ToolCallResult UpdateMethodSource(
+        ToolContext ctx,
+        [ToolParam("Path to target assembly (.exe/.dll).")]
+        string assemblyPath,
+        [ToolParam("Full name of the declaring type.")]
+        string typeFullName,
+        [ToolParam("Method name to replace (must match the method declared in source).")]
+        string methodName,
+        [ToolParam("A full C# method declaration whose signature matches the target (e.g. \"public int Add(int a, int b) { return a + b; }\"). Only imperative bodies are supported: no lambdas, async, iterators, or access to the target type's own private members.")]
+        string source,
+        [ToolParam("Optional parameter type list to pick a specific overload.")]
+        string[]? parameterTypeNames = null,
+        [ToolParam("Patch in place (default false).")]
+        bool inPlace = false,
+        [ToolParam("Output path when not inPlace. Optional.")]
+        string? outputPath = null)
+    {
+        try
+        {
+            var result = ctx.Analysis.UpdateMethodSource(assemblyPath, typeFullName, methodName, parameterTypeNames, source, inPlace, outputPath);
+            return new ToolCallResult(result, new
+            {
+                assemblyPath,
+                typeFullName,
+                methodName,
+                parameterTypeNames,
+                inPlace,
+                outputPath,
+                backupAlwaysCreated = true,
+                result
+            });
+        }
+        catch (Exception ex)
+        {
+            return ErrorResult(ex);
+        }
+    }
+
     [McpTool("format_dnspy_jump", "Build step-by-step dnSpy navigation instructions from metadata tokens.")]
     public static ToolCallResult FormatDnSpyJump(
         ToolContext ctx,
@@ -299,6 +533,14 @@ internal static class DnSpyTools
             steps = lines
         });
     }
+
+    private static ToolCallResult ErrorResult(Exception ex) =>
+        new($"Error: {ex.Message}\n{ex.StackTrace}", new
+        {
+            error = true,
+            message = ex.Message,
+            stackTrace = ex.StackTrace
+        });
 
     private static string? NormalizeToken(string? token)
     {

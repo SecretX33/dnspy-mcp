@@ -14,5 +14,6 @@
   <ItemGroup>
     <PackageReference Include="dnlib" Version="4.5.0" />
     <PackageReference Include="ICSharpCode.Decompiler" Version="8.2.0.7535" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.11.0" />
   </ItemGroup>
 </Project>

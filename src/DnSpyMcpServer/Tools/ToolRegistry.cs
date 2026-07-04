@@ -66,7 +66,16 @@ internal sealed class ToolRegistry
             }
         }
 
-        var result = tool.Method.Invoke(null, invokeArgs);
+        object? result;
+        try
+        {
+            result = tool.Method.Invoke(null, invokeArgs);
+        }
+        catch (TargetInvocationException ex) when (ex.InnerException is not null)
+        {
+            throw ex.InnerException;
+        }
+
         return result switch
         {
             ToolCallResult typed => typed,
@@ -102,6 +111,15 @@ internal sealed class ToolRegistry
                 {
                     type = "array",
                     items = new { type = "string" },
+                    description = parameterDescription
+                };
+            }
+            else if (parameterType.IsEnum)
+            {
+                properties[parameter.Name!] = new
+                {
+                    type = "string",
+                    @enum = Enum.GetNames(parameterType),
                     description = parameterDescription
                 };
             }
@@ -181,7 +199,7 @@ internal sealed class ToolRegistry
     private static string ToJsonSchemaType(Type type)
     {
         if (type == typeof(bool)) return "boolean";
-        if (type == typeof(int) || type == typeof(long) || type.IsEnum) return "integer";
+        if (type == typeof(int) || type == typeof(long)) return "integer";
         if (type == typeof(float) || type == typeof(double) || type == typeof(decimal)) return "number";
         if (type == typeof(string[])) return "array";
         return "string";
