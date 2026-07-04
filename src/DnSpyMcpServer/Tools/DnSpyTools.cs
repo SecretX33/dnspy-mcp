@@ -446,7 +446,7 @@ internal static class DnSpyTools
         string typeFullName,
         [ToolParam("Method name to replace (must match the method declared in source).")]
         string methodName,
-        [ToolParam("A full C# method declaration whose signature matches the target (e.g. \"public int Add(int a, int b) { return a + b; }\"). Only imperative bodies are supported: no lambdas, async, iterators, or access to the target type's own private members.")]
+        [ToolParam("A full C# method declaration whose signature matches the target (e.g. \"public int Add(int a, int b) { return a + b; }\"). Only imperative bodies are supported (no lambdas, async, iterators). The body may use 'this' and the target type's own private members when the target is a non-generic, top-level class (sealed included); value types, delegates, static classes, and generic or nested targets fall back to a wrapper without this/private access, and the result reports which path was taken.")]
         string source,
         [ToolParam("Optional parameter type list to pick a specific overload.")]
         string[]? parameterTypeNames = null,

@@ -445,7 +445,7 @@ internal sealed class AssemblyAnalysisService
             var type = FindType(module, typeFullName);
             var target = FindMethod(type, methodName, parameterTypeNames);
 
-            var compiled = CompileMethod(referenceRoot, source, out var diagnostics);
+            var compiled = CompileMethod(referenceRoot, type, source, out var subclassed, out var diagnostics);
             if (compiled is null)
                 throw new InvalidOperationException("Compilation failed:" + Environment.NewLine + diagnostics);
 
@@ -475,6 +475,7 @@ internal sealed class AssemblyAnalysisService
             {
                 $"typeDef: {FormatToken(type.MDToken.Raw)}",
                 $"methodDef: {FormatToken(target.MDToken.Raw)}",
+                $"access: {(subclassed ? "subclassed target (this and the target's own private members are available)" : "standalone wrapper (no this or private-member access; target is a value type, delegate, static, generic, or nested type, or has no satisfiable constructor)")}",
                 $"localsCopied: {target.Body!.Variables.Count}",
                 $"instructionsCopied: {target.Body.Instructions.Count}",
                 "-- new body --"
@@ -482,27 +483,24 @@ internal sealed class AssemblyAnalysisService
         });
     }
 
-    private static byte[]? CompileMethod(string referenceRoot, string source, out string diagnostics)
+    private static byte[]? CompileMethod(string referenceRoot, TypeDef targetType, string source, out bool subclassed, out string diagnostics)
     {
-        var wrapper = $$"""
-            using System;
-            using System.Collections;
-            using System.Collections.Generic;
-            using System.Globalization;
-            using System.Linq;
-            using System.Text;
+        var wrapper = BuildWrapperSource(targetType, source, out subclassed);
 
-            public class {{PatchTypeName}}
-            {
-            {{source}}
-            }
-            """;
+        byte[]? publicizedTarget = null;
+        if (subclassed)
+        {
+            // Only needed when the wrapper subclasses the target; on failure fall back to the on-disk reference,
+            // which still permits public/protected members via `this`.
+            try { publicizedTarget = BuildPublicizedImage(referenceRoot); }
+            catch { publicizedTarget = null; }
+        }
 
         var tree = Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree.ParseText(wrapper);
         var compilation = Microsoft.CodeAnalysis.CSharp.CSharpCompilation.Create(
             assemblyName: "__DnSpyMcpPatchAsm",
             syntaxTrees: new[] { tree },
-            references: GatherReferences(referenceRoot),
+            references: GatherReferences(referenceRoot, publicizedTarget, targetType.Module.Assembly?.Name?.String),
             options: new Microsoft.CodeAnalysis.CSharp.CSharpCompilationOptions(
                 Microsoft.CodeAnalysis.OutputKind.DynamicallyLinkedLibrary,
                 allowUnsafe: true,
@@ -522,7 +520,76 @@ internal sealed class AssemblyAnalysisService
         return ms.ToArray();
     }
 
-    private static List<Microsoft.CodeAnalysis.MetadataReference> GatherReferences(string referenceRoot)
+    private const string WrapperUsings =
+        "using System;\n" +
+        "using System.Collections;\n" +
+        "using System.Collections.Generic;\n" +
+        "using System.Globalization;\n" +
+        "using System.Linq;\n" +
+        "using System.Text;\n\n";
+
+    // Compiles the supplied method inside a wrapper type. When the target can be subclassed, the wrapper derives from
+    // it so `this` is the target type and the body can use the target's own members (including private ones, made
+    // reachable by compiling against a publicized copy of the target); those member references graft back to local
+    // definitions. Otherwise it falls back to a standalone wrapper with no access to the target's instance members.
+    private static string BuildWrapperSource(TypeDef targetType, string source, out bool subclassed)
+    {
+        if (CanSubclass(targetType, out var ctorMember))
+        {
+            subclassed = true;
+            return WrapperUsings +
+                $"public abstract class {PatchTypeName} : {targetType.FullName}\n" +
+                "{\n" +
+                ctorMember +
+                source + "\n" +
+                "}\n";
+        }
+
+        subclassed = false;
+        return WrapperUsings +
+            $"public class {PatchTypeName}\n" +
+            "{\n" +
+            source + "\n" +
+            "}\n";
+    }
+
+    // Decides whether the wrapper can derive from the target type. Value types, enums, delegates and static classes are
+    // sealed and fall out here; interfaces, generic and nested targets are left for the standalone fallback. Emits an
+    // explicit base-constructor call (via the target-typed `default` literal) only when there is no parameterless ctor
+    // and exactly one shortest-arity ctor to bind unambiguously.
+    private static bool CanSubclass(TypeDef targetType, out string ctorMember)
+    {
+        ctorMember = string.Empty;
+
+        // Sealed reference classes are fine: the publicized copy is unsealed for the compile. Exclude the kinds that
+        // genuinely cannot serve as a base class: value types, delegates, and static (abstract+sealed) classes, plus
+        // interfaces, generic and nested targets (out of scope), and targets with no assembly identity.
+        if (targetType.IsInterface || targetType.IsValueType
+            || string.Equals(targetType.BaseType?.FullName, "System.MulticastDelegate", StringComparison.Ordinal)
+            || (targetType.IsAbstract && targetType.IsSealed)
+            || targetType.HasGenericParameters || targetType.DeclaringType is not null
+            || targetType.Module.Assembly?.Name is null)
+            return false;
+
+        var instanceCtors = targetType.Methods
+            .Where(m => m.IsConstructor && !m.IsStatic && m.MethodSig is not null)
+            .ToArray();
+        if (instanceCtors.Length == 0)
+            return false;
+
+        if (instanceCtors.Any(c => c.MethodSig.Params.Count == 0))
+            return true; // implicit base() binds; the publicized copy makes a non-public parameterless ctor callable
+
+        var minArity = instanceCtors.Min(c => c.MethodSig.Params.Count);
+        var shortest = instanceCtors.Where(c => c.MethodSig.Params.Count == minArity).ToArray();
+        if (shortest.Length != 1)
+            return false; // ambiguous base(default, ...) — fall back rather than risk binding the wrong ctor
+
+        ctorMember = $"    private {PatchTypeName}() : base({string.Join(", ", Enumerable.Repeat("default", minArity))}) {{ }}\n";
+        return true;
+    }
+
+    private static List<Microsoft.CodeAnalysis.MetadataReference> GatherReferences(string referenceRoot, byte[]? publicizedTarget, string? targetSimpleName)
     {
         var references = new List<Microsoft.CodeAnalysis.MetadataReference>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -537,8 +604,14 @@ internal sealed class AssemblyAnalysisService
             }
         }
 
-        // The target assembly and its neighbours, so the source can call into the app's own types.
-        // Framework assemblies already provided by the host win (deduped by file name) to avoid clashes.
+        // The publicized image is the single reference that carries the target's identity, so the body can reach the
+        // target's private members. Any other on-disk file that shares that identity (e.g. a prior *.patched copy) is
+        // skipped below; two references with the same identity would let Roslyn bind against the non-publicized one.
+        if (publicizedTarget is not null)
+            references.Add(Microsoft.CodeAnalysis.MetadataReference.CreateFromImage(publicizedTarget));
+
+        // The target's neighbours, so the source can call into the app's own types. Framework assemblies already
+        // provided by the host win (deduped by file name) to avoid clashes.
         var directory = Path.GetDirectoryName(referenceRoot);
         if (directory is not null && Directory.Exists(directory))
         {
@@ -546,12 +619,49 @@ internal sealed class AssemblyAnalysisService
             {
                 if (!seen.Add(Path.GetFileName(file)))
                     continue;
+                if (publicizedTarget is not null && SharesIdentity(file, targetSimpleName))
+                    continue;
                 try { references.Add(Microsoft.CodeAnalysis.MetadataReference.CreateFromFile(file)); }
                 catch { /* skip native/unreadable files */ }
             }
         }
 
         return references;
+    }
+
+    private static bool SharesIdentity(string file, string? targetSimpleName)
+    {
+        if (targetSimpleName is null)
+            return false;
+        try { return string.Equals(System.Reflection.AssemblyName.GetAssemblyName(file).Name, targetSimpleName, StringComparison.OrdinalIgnoreCase); }
+        catch { return false; }
+    }
+
+    // A compile-against copy of the target with every type and member made public (and reference types unsealed), so the
+    // subclass wrapper can derive from the target and reference its own private members (Roslyn does not honor
+    // IgnoresAccessChecksTo at compile time). The emitted references bind by name to the real, still-private members
+    // during grafting, and because the grafted method lives inside the target type, the access is legal at runtime.
+    private static byte[] BuildPublicizedImage(string assemblyPath)
+    {
+        using var module = ModuleDefMD.Load(File.ReadAllBytes(assemblyPath));
+        foreach (var type in module.GetTypes())
+        {
+            var attributes = (type.Attributes & ~TypeAttributes.VisibilityMask)
+                | (type.IsNested ? TypeAttributes.NestedPublic : TypeAttributes.Public);
+            // Unseal reference types so the wrapper can subclass a sealed target at compile time; the shipped binary is
+            // untouched. Value types stay sealed since C# forbids deriving from them anyway.
+            if (!type.IsValueType)
+                attributes &= ~TypeAttributes.Sealed;
+            type.Attributes = attributes;
+            foreach (var method in type.Methods)
+                method.Attributes = (method.Attributes & ~MethodAttributes.MemberAccessMask) | MethodAttributes.Public;
+            foreach (var field in type.Fields)
+                field.Attributes = (field.Attributes & ~FieldAttributes.FieldAccessMask) | FieldAttributes.Public;
+        }
+
+        using var ms = new MemoryStream();
+        module.Write(ms);
+        return ms.ToArray();
     }
 
     // Clones a compiled method body into the target method, importing every type/method/field reference into the
