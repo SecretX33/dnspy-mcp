@@ -182,7 +182,7 @@ internal static class DnSpyTools
         });
     }
 
-    [McpTool("patch_replace_string_literal", "Patch one IL string literal at a method token + IL offset. Always creates a backup first.")]
+    [McpTool("patch_replace_string_literal", "Patch one IL string literal at a method token + IL offset. A backup of the assembly is automatically created each time this tool is used.")]
     public static ToolCallResult PatchReplaceStringLiteral(
         ToolContext ctx,
         [ToolParam("Path to target assembly (.exe/.dll).")]
@@ -212,7 +212,7 @@ internal static class DnSpyTools
         });
     }
 
-    [McpTool("patch_nop_instructions", "Patch one or more IL instructions to NOP starting at an IL offset. Always creates a backup first.")]
+    [McpTool("patch_nop_instructions", "Patch one or more IL instructions to NOP starting at an IL offset. A backup of the assembly is automatically created each time this tool is used.")]
     public static ToolCallResult PatchNopInstructions(
         ToolContext ctx,
         [ToolParam("Path to target assembly (.exe/.dll).")]
@@ -242,7 +242,7 @@ internal static class DnSpyTools
         });
     }
 
-    [McpTool("rename_type", "Rename a type (and optionally move its namespace), writing a patched assembly. Always creates a backup first.")]
+    [McpTool("rename_type", "Rename a type (and optionally move its namespace), writing a patched assembly. A backup of the assembly is automatically created each time this tool is used.")]
     public static ToolCallResult RenameType(
         ToolContext ctx,
         [ToolParam("Path to target assembly (.exe/.dll).")]
@@ -279,7 +279,7 @@ internal static class DnSpyTools
         }
     }
 
-    [McpTool("rename_method", "Rename a method, writing a patched assembly. Always creates a backup first.")]
+    [McpTool("rename_method", "Rename a method, writing a patched assembly. A backup of the assembly is automatically created each time this tool is used.")]
     public static ToolCallResult RenameMethod(
         ToolContext ctx,
         [ToolParam("Path to target assembly (.exe/.dll).")]
@@ -319,7 +319,7 @@ internal static class DnSpyTools
         }
     }
 
-    [McpTool("rename_namespace", "Rename a namespace across all its types, writing a patched assembly. Always creates a backup first.")]
+    [McpTool("rename_namespace", "Rename a namespace across all its types, writing a patched assembly. A backup of the assembly is automatically created each time this tool is used.")]
     public static ToolCallResult RenameNamespace(
         ToolContext ctx,
         [ToolParam("Path to target assembly (.exe/.dll).")]
@@ -353,7 +353,7 @@ internal static class DnSpyTools
         }
     }
 
-    [McpTool("set_function_opcodes", "Edit a method's IL at a 0-based instruction index. mode=Overwrite replaces from the index, mode=Append inserts. Always creates a backup first.")]
+    [McpTool("set_function_opcodes", "Edit a method's IL at a 0-based instruction index. mode=Overwrite replaces from the index, mode=Append inserts. A backup of the assembly is automatically created each time this tool is used.")]
     public static ToolCallResult SetFunctionOpcodes(
         ToolContext ctx,
         [ToolParam("Path to target assembly (.exe/.dll).")]
@@ -398,7 +398,7 @@ internal static class DnSpyTools
         }
     }
 
-    [McpTool("overwrite_method_body", "Clear a method body and rebuild it entirely from IL opcode lines. Always creates a backup first.")]
+    [McpTool("overwrite_method_body", "Clear a method body and rebuild it entirely from IL opcode lines. A backup of the assembly is automatically created each time this tool is used.")]
     public static ToolCallResult OverwriteMethodBody(
         ToolContext ctx,
         [ToolParam("Path to target assembly (.exe/.dll).")]
@@ -437,7 +437,7 @@ internal static class DnSpyTools
         }
     }
 
-    [McpTool("update_method_source", "Replace a method body by compiling a C# method with Roslyn and splicing its IL in. The declared method name must match. Always creates a backup first.")]
+    [McpTool("update_method_source", "Replace a method body by compiling a C# method with Roslyn and splicing its IL in. The declared method name must match. A backup of the assembly is automatically created each time this tool is used.")]
     public static ToolCallResult UpdateMethodSource(
         ToolContext ctx,
         [ToolParam("Path to target assembly (.exe/.dll).")]
