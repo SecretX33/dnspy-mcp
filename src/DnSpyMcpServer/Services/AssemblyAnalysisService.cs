@@ -382,6 +382,7 @@ internal sealed class AssemblyAnalysisService
                     instructions.Insert(index + i, parsed[i]);
             }
 
+            EnsureBranchTargetsPresent(instructions);
             method.Body.UpdateInstructionOffsets();
             method.Body.KeepOldMaxStack = false;
 
@@ -458,6 +459,15 @@ internal sealed class AssemblyAnalysisService
                 throw new InvalidOperationException($"Static/instance mismatch: target {(target.IsStatic ? "is" : "is not")} static, supplied method {(patchMethod.IsStatic ? "is" : "is not")}.");
             if (patchMethod.MethodSig.Params.Count != target.MethodSig.Params.Count)
                 throw new InvalidOperationException($"Parameter count mismatch: target has {target.MethodSig.Params.Count}, supplied method has {patchMethod.MethodSig.Params.Count}.");
+            // TypeSig.FullName carries no assembly scope, so this compares by namespace+name and stays correct even
+            // when a parameter or return type is one of the target module's own types.
+            if (!string.Equals(patchMethod.MethodSig.RetType.FullName, target.MethodSig.RetType.FullName, StringComparison.Ordinal))
+                throw new InvalidOperationException($"Return type mismatch: target returns '{target.MethodSig.RetType.FullName}', supplied method returns '{patchMethod.MethodSig.RetType.FullName}'.");
+            for (var i = 0; i < target.MethodSig.Params.Count; i++)
+            {
+                if (!string.Equals(patchMethod.MethodSig.Params[i].FullName, target.MethodSig.Params[i].FullName, StringComparison.Ordinal))
+                    throw new InvalidOperationException($"Parameter {i} type mismatch: target expects '{target.MethodSig.Params[i].FullName}', supplied method has '{patchMethod.MethodSig.Params[i].FullName}'.");
+            }
 
             CopyMethodBody(module, patchMethod, target);
 
@@ -639,7 +649,44 @@ internal sealed class AssemblyAnalysisService
     // patching. Resolve those to the module's own definitions; only genuinely external (e.g. BCL) references
     // go through the importer, which would otherwise leave a dangling ref to the compiled patch assembly.
     private static ITypeDefOrRef ImportType(ModuleDefMD targetModule, Importer importer, ITypeDefOrRef type)
-        => targetModule.Find(type.FullName, false) ?? importer.Import(type);
+    {
+        var local = targetModule.Find(type.FullName, false);
+        if (local is not null)
+            return local;
+
+        // A generic instantiation or array/byref over one of the target's own types is a TypeSpec that never
+        // name-matches a TypeDef, so importing it would recreate a dangling self-reference. That is outside the
+        // supported imperative-body scope, so fail loudly instead of writing a corrupt ref. Pure BCL composites
+        // (e.g. List<int>) reference no local type and import cleanly.
+        if (type is TypeSpec spec && ReferencesLocalType(targetModule, spec.TypeSig))
+            throw new InvalidOperationException(
+                $"Cannot safely graft the composed type '{type.FullName}': it is built over one of the target module's " +
+                "own types, which is outside the supported imperative-body scope. Rewrite the body to avoid it, or use " +
+                "set_function_opcodes/overwrite_method_body.");
+
+        return importer.Import(type);
+    }
+
+    private static bool ReferencesLocalType(ModuleDefMD targetModule, TypeSig? sig)
+    {
+        while (sig is not null)
+        {
+            switch (sig)
+            {
+                case GenericInstSig git:
+                    if (ReferencesLocalType(targetModule, git.GenericType))
+                        return true;
+                    return git.GenericArguments.Any(arg => ReferencesLocalType(targetModule, arg));
+                case TypeDefOrRefSig leaf:
+                    return targetModule.Find(leaf.TypeDefOrRef.FullName, false) is not null;
+                default:
+                    sig = sig.Next;
+                    break;
+            }
+        }
+
+        return false;
+    }
 
     private static dnlib.DotNet.IMethod ImportMethod(ModuleDefMD targetModule, Importer importer, dnlib.DotNet.IMethod method)
     {
@@ -658,31 +705,31 @@ internal sealed class AssemblyAnalysisService
     private static MethodDef? FindMatchingMethod(TypeDef type, dnlib.DotNet.IMethod method)
     {
         var signature = method.MethodSig;
-        MethodDef? byNameOnly = null;
-        foreach (var candidate in type.Methods)
+        var sameName = type.Methods
+            .Where(m => string.Equals(m.Name, method.Name, StringComparison.Ordinal))
+            .ToArray();
+
+        if (sameName.Length == 0)
+            return null;
+
+        if (signature is not null)
         {
-            if (!string.Equals(candidate.Name, method.Name, StringComparison.Ordinal))
-                continue;
-            byNameOnly ??= candidate;
-
-            if (signature is null || candidate.MethodSig.Params.Count != signature.Params.Count)
-                continue;
-
-            var match = true;
-            for (var i = 0; i < signature.Params.Count; i++)
-            {
-                if (!string.Equals(candidate.MethodSig.Params[i].FullName, signature.Params[i].FullName, StringComparison.Ordinal))
-                {
-                    match = false;
-                    break;
-                }
-            }
-
-            if (match)
-                return candidate;
+            var exact = sameName.FirstOrDefault(candidate =>
+                candidate.MethodSig.Params.Count == signature.Params.Count &&
+                Enumerable.Range(0, signature.Params.Count).All(i =>
+                    string.Equals(candidate.MethodSig.Params[i].FullName, signature.Params[i].FullName, StringComparison.Ordinal)));
+            if (exact is not null)
+                return exact;
         }
 
-        return byNameOnly;
+        // Either there was no signature to match on, or none of the overloads lined up. Bind by name only when it is
+        // unambiguous; refuse to guess between overloads rather than silently splice a call to the wrong one.
+        if (sameName.Length == 1)
+            return sameName[0];
+
+        throw new InvalidOperationException(
+            $"Cannot resolve a call to '{type.FullName}.{method.Name}': multiple overloads exist and none matches the " +
+            "compiled call's signature (a local overloaded/generic call is outside the supported imperative-body scope).");
     }
 
     // Assembles opcode strings ("ldstr \"hi\"", "call System.Console::WriteLine(System.String)", "br 4") into
@@ -758,7 +805,7 @@ internal sealed class AssemblyAnalysisService
         if (typeDef is not null)
             return typeDef;
 
-        var reflectionType = Type.GetType(typeName, throwOnError: false);
+        var reflectionType = ResolveClrType(typeName);
         if (reflectionType is not null)
             return importer.Import(reflectionType);
 
@@ -779,7 +826,7 @@ internal sealed class AssemblyAnalysisService
                 return method;
         }
 
-        var reflectionType = Type.GetType(typeName, throwOnError: false);
+        var reflectionType = ResolveClrType(typeName);
         if (reflectionType is not null)
         {
             var method = FindReflectionMethod(reflectionType, memberName, parameterTypes);
@@ -802,7 +849,7 @@ internal sealed class AssemblyAnalysisService
                 return field;
         }
 
-        var reflectionType = Type.GetType(typeName, throwOnError: false);
+        var reflectionType = ResolveClrType(typeName);
         if (reflectionType is not null)
         {
             var field = reflectionType.GetField(memberName,
@@ -813,6 +860,39 @@ internal sealed class AssemblyAnalysisService
         }
 
         throw new InvalidOperationException($"Could not resolve field operand '{operandText}'. Expected 'Type::Field'.");
+    }
+
+    // Resolves an external (non-target-module) type by full name against the host runtime. Type.GetType alone only
+    // sees System.Private.CoreLib and this assembly, so framework types like System.Console fail; loading the
+    // mscorlib/netstandard facades and going through their type-forwarder tables resolves them to the real assembly.
+    private static Type? ResolveClrType(string typeName)
+    {
+        var type = Type.GetType(typeName, throwOnError: false);
+        if (type is not null)
+            return type;
+
+        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            type = assembly.GetType(typeName, throwOnError: false);
+            if (type is not null)
+                return type;
+        }
+
+        foreach (var facade in new[] { "mscorlib", "netstandard", "System.Runtime" })
+        {
+            try
+            {
+                type = System.Reflection.Assembly.Load(facade).GetType(typeName, throwOnError: false);
+                if (type is not null)
+                    return type;
+            }
+            catch
+            {
+                // facade not present on this runtime; try the next one
+            }
+        }
+
+        return null;
     }
 
     private static (string TypeName, string MemberName, string[]? ParameterTypes) SplitMemberReference(string operandText, string kind)
@@ -965,8 +1045,17 @@ internal sealed class AssemblyAnalysisService
                 ThrowOnAssemblyResolveErrors = false
             };
 
-            var decompiler = new CSharpDecompiler(path, settings);
-            return new LoadedAssembly(path, module, decompiler);
+            // Load the PE image fully into memory so the decompiler retains no OS file handle; otherwise a later
+            // in-place write to the same file in this session would hit a sharing violation. Disposed on invalidation.
+            var peFile = new ICSharpCode.Decompiler.Metadata.PEFile(
+                path,
+                new MemoryStream(File.ReadAllBytes(path)),
+                System.Reflection.PortableExecutable.PEStreamOptions.PrefetchEntireImage);
+            var resolver = new ICSharpCode.Decompiler.Metadata.UniversalAssemblyResolver(
+                path, throwOnError: false,
+                ICSharpCode.Decompiler.Metadata.DotNetCorePathFinderExtensions.DetectTargetFrameworkId(peFile));
+            var decompiler = new CSharpDecompiler(peFile, resolver, settings);
+            return new LoadedAssembly(path, module, peFile, decompiler);
         });
     }
 
@@ -974,7 +1063,10 @@ internal sealed class AssemblyAnalysisService
     {
         var normalized = NormalizePath(assemblyPath);
         if (_cache.TryRemove(normalized, out var entry))
+        {
             entry.Module.Dispose();
+            entry.PeFile.Dispose();
+        }
     }
 
     // Shared write path for every mutating tool: always back up first, load the module from an in-memory
@@ -1010,6 +1102,28 @@ internal sealed class AssemblyAnalysisService
         };
         lines.AddRange(detail);
         return string.Join(Environment.NewLine, lines);
+    }
+
+    // A partial Overwrite swaps Instruction objects in place; any branch or switch elsewhere in the body that still
+    // points at a replaced (now-removed) object would dangle and make module.Write throw. Detect it up front and fail
+    // with a clear message rather than emitting a broken assembly. HashSet uses reference identity, which is what we want.
+    private static void EnsureBranchTargetsPresent(IList<Instruction> instructions)
+    {
+        var present = new HashSet<Instruction>(instructions);
+        foreach (var instruction in instructions)
+        {
+            var orphaned = instruction.Operand switch
+            {
+                Instruction target => !present.Contains(target),
+                Instruction[] targets => targets.Any(t => !present.Contains(t)),
+                _ => false
+            };
+
+            if (orphaned)
+                throw new InvalidOperationException(
+                    "This overwrite orphans an existing branch/switch target (a jump elsewhere in the method pointed at a " +
+                    "replaced instruction). Use overwrite_method_body to rebuild the whole body instead.");
+        }
     }
 
     private static int IndexOfOffset(IList<Instruction> instructions, int offset)
@@ -1192,5 +1306,5 @@ internal sealed class AssemblyAnalysisService
         return null;
     }
 
-    private sealed record LoadedAssembly(string Path, ModuleDefMD Module, CSharpDecompiler Decompiler);
+    private sealed record LoadedAssembly(string Path, ModuleDefMD Module, ICSharpCode.Decompiler.Metadata.PEFile PeFile, CSharpDecompiler Decompiler);
 }

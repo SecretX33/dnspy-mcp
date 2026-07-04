@@ -129,9 +129,9 @@ Target a method by `typeFullName` + `methodName` (+ optional `parameterTypeNames
 - compile a full C# method with Roslyn, then splice its IL into the target
 - references to the target assembly's own types are resolved to local definitions; only external/BCL references are imported
 
-IL assembler operand support (`set_function_opcodes`, `overwrite_method_body`): no-operand opcodes, `ldstr`, `ldc.i4/i8/r4/r8`, `call`/`callvirt`/`newobj` (as `Type::Method(ParamType, ...)`), `ld`/`st` fields (as `Type::Field`), type operands, and branch targets addressed by 0-based instruction index. Anything else fails loudly rather than emitting a wrong instruction.
+IL assembler operand support (`set_function_opcodes`, `overwrite_method_body`): no-operand opcodes, `ldstr`, `ldc.i4/i8/r4/r8`, `call`/`callvirt`/`newobj` (as `Type::Method(ParamType, ...)`), `ld`/`st` fields (as `Type::Field`), type operands, and branch targets addressed by 0-based instruction index. Operands naming the target's own types bind locally; external framework types like `System.Console` also resolve. Anything else fails loudly rather than emitting a wrong instruction. A partial `Overwrite` that would orphan an existing branch/switch target is rejected; use `overwrite_method_body` to rebuild the whole body instead.
 
-`update_method_source` limits: the declared method name must match the target, the signature must line up (same static/instance and parameter count), and only imperative bodies are supported (no lambdas, async, iterators, or access to the target type's own private members, since these need generated helper types that do not exist in the target).
+`update_method_source` limits: the declared method name must match the target, the full signature must line up (static/instance, parameter count and types, return type), and only imperative bodies are supported (no lambdas, async, iterators, or access to the target type's own private members, since these need generated helper types that do not exist in the target). Ambiguous overload calls and composed types over the target's own types are rejected rather than mis-bound.
 
 #### Patch safety rule
 

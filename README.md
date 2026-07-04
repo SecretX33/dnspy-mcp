@@ -321,7 +321,7 @@ All of these always create a backup first and, unless `inPlace: true`, write to 
 }
 ```
 
-`update_method_source` (rewrite a method body in C#; the declared method name must match). Only imperative bodies are supported (no lambdas, async, iterators, or access to the target type's own private members):
+`update_method_source` (rewrite a method body in C#; the declared method name must match and its full signature, static/instance, parameter count and types, and return type, must match the target, checked before any write). Only imperative bodies are supported (no lambdas, async, iterators, or access to the target type's own private members):
 
 ```json
 {
